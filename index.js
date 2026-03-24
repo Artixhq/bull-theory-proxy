@@ -1,58 +1,119 @@
-const express = require('express');
-const fetch   = require('node-fetch');
-const app     = express();
-const PORT    = process.env.PORT || 3000;
+const http  = require('http');
+const https = require('https');
+const PORT  = process.env.PORT || 8080;
 
-// Allow requests from your Netlify site
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET');
-  next();
-});
+function get(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers }, (res) => {
+      // Follow redirects
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return get(res.headers.location, headers).then(resolve).catch(reject);
+      }
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { reject(new Error('Parse: ' + data.slice(0, 300))); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(8000, () => { req.destroy(); reject(new Error('Timeout')); });
+  });
+}
 
-// GET /prices — returns all 9 assets
-app.get('/prices', async (req, res) => {
+async function getPrices() {
+  const result = {};
+
+  // Yahoo Finance with proper headers (works server-side)
+  const symbols = ['^NDX', '^GSPC', 'GC=F', 'SI=F', 'CL=F', '^N225', '^KS11'];
+  const map = {
+    '^NDX':  { sym: 'NASDAQ'  },
+    '^GSPC': { sym: 'S&P 500' },
+    'GC=F':  { sym: 'GOLD'    },
+    'SI=F':  { sym: 'SILVER'  },
+    'CL=F':  { sym: 'US OIL'  },
+    '^N225': { sym: 'NIKKEI'  },
+    '^KS11': { sym: 'KOSPI'   },
+  };
+
+  // Try Yahoo Finance v8 endpoint
   try {
-    const symbols = ['^NDX', '^GSPC', 'GC=F', 'SI=F', 'CL=F', '^N225', '^KS11'].join(',');
-    const url     = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}&fields=regularMarketPrice,regularMarketChangePercent`;
-
-    const r = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        'Accept': 'application/json',
-      }
+    const symStr = symbols.map(s => encodeURIComponent(s)).join('%2C');
+    const url = `https://query2.finance.yahoo.com/v8/finance/spark?symbols=${symStr}&range=1d&interval=1d`;
+    const data = await get(url, {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Origin': 'https://finance.yahoo.com',
+      'Referer': 'https://finance.yahoo.com',
     });
 
-    const data   = await r.json();
-    const quotes = data?.quoteResponse?.result || [];
-
-    const map = {
-      '^NDX':  { sym: 'NASDAQ'  },
-      '^GSPC': { sym: 'S&P 500' },
-      'GC=F':  { sym: 'GOLD'    },
-      'SI=F':  { sym: 'SILVER'  },
-      'CL=F':  { sym: 'US OIL'  },
-      '^N225': { sym: 'NIKKEI'  },
-      '^KS11': { sym: 'KOSPI'   },
-    };
-
-    const result = {};
-    quotes.forEach(q => {
-      const m = map[q.symbol];
-      if (m) {
-        result[m.sym] = {
-          price:  q.regularMarketPrice,
-          change: q.regularMarketChangePercent || 0,
-        };
-      }
-    });
-
-    res.json({ success: true, data: result });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    // v8 spark returns different structure
+    if (data.spark && data.spark.result) {
+      data.spark.result.forEach(r => {
+        const m = map[r.symbol];
+        if (m && r.response && r.response[0]) {
+          const resp   = r.response[0];
+          const prices = resp.indicators?.quote?.[0]?.close || [];
+          const meta   = resp.meta || {};
+          const price  = meta.regularMarketPrice || prices[prices.length - 1];
+          const prev   = meta.chartPreviousClose || prices[0];
+          const change = prev ? ((price - prev) / prev) * 100 : 0;
+          if (price) result[m.sym] = { price, change };
+        }
+      });
+    }
+  } catch(e) {
+    console.log('Spark failed:', e.message);
   }
+
+  // Fallback: try v7 quote endpoint
+  if (Object.keys(result).length === 0) {
+    try {
+      const symStr = symbols.join(',');
+      const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symStr)}`;
+      const data = await get(url, {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+        'Accept': 'application/json',
+        'Cookie': 'B=abc; YFC=1',
+      });
+      const quotes = data?.quoteResponse?.result || [];
+      quotes.forEach(q => {
+        const m = map[q.symbol];
+        if (m && q.regularMarketPrice) {
+          result[m.sym] = { price: q.regularMarketPrice, change: q.regularMarketChangePercent || 0 };
+        }
+      });
+    } catch(e) {
+      console.log('v7 failed:', e.message);
+    }
+  }
+
+  return result;
+}
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+  if (req.url === '/health') { res.writeHead(200); res.end(JSON.stringify({ status: 'ok' })); return; }
+
+  if (req.url === '/prices') {
+    try {
+      const data = await getPrices();
+      console.log('Prices fetched:', JSON.stringify(data));
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, data }));
+    } catch(e) {
+      console.log('Error:', e.message);
+      res.writeHead(500);
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-app.listen(PORT, () => console.log(`Bull Theory proxy running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
