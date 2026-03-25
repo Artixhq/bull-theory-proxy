@@ -2,20 +2,16 @@ const http  = require('http');
 const https = require('https');
 const PORT  = process.env.PORT || 8080;
 
-const BEARER_TOKEN = process.env.BEARER_TOKEN || 'AAAAAAAAAAAAAAAAAAAAACgy8gEAAAAA%2BJ%2FV%2BkUXmrYRL%2FtJoZUVmEZF0TY%3DGJMqXwLaJbWHgPWyogRLeXjsQsFQs8zXHqaBlR2pundHipsGMx';
-const TWITTER_USER_ID = ''; // will be fetched dynamically
+const BEARER_TOKEN = process.env.BEARER_TOKEN;
 
 function get(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const req = https.get(url, { headers }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return get(res.headers.location, headers).then(resolve).catch(reject);
-      }
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error('Parse error: ' + data.slice(0, 200))); }
+        try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+        catch(e) { reject(new Error('Parse error: ' + data.slice(0, 300))); }
       });
     });
     req.on('error', reject);
@@ -23,17 +19,22 @@ function get(url, headers = {}) {
   });
 }
 
-const AUTH = { 'Authorization': `Bearer ${decodeURIComponent(BEARER_TOKEN)}` };
+const AUTH = { 'Authorization': `Bearer ${BEARER_TOKEN}` };
 
-async function getUserId(username) {
-  const data = await get(`https://api.twitter.com/2/users/by/username/${username}`, AUTH);
-  return data?.data?.id;
-}
+async function getTweets() {
+  // Step 1: get user ID
+  const userRes = await get('https://api.twitter.com/2/users/by/username/BullTheoryio?user.fields=id', AUTH);
+  console.log('User response:', userRes.status, JSON.stringify(userRes.body));
 
-async function getTweets(userId) {
-  const url = `https://api.twitter.com/2/users/${userId}/tweets?max_results=5&tweet.fields=created_at,text&exclude=retweets,replies`;
-  const data = await get(url, AUTH);
-  return data?.data || [];
+  const userId = userRes.body?.data?.id;
+  if (!userId) throw new Error('Could not get user ID: ' + JSON.stringify(userRes.body));
+
+  // Step 2: get tweets
+  const tweetUrl = `https://api.twitter.com/2/users/${userId}/tweets?max_results=5&tweet.fields=created_at,text&exclude=retweets,replies`;
+  const tweetRes = await get(tweetUrl, AUTH);
+  console.log('Tweets response:', tweetRes.status, JSON.stringify(tweetRes.body).slice(0, 300));
+
+  return tweetRes.body?.data || [];
 }
 
 const server = http.createServer(async (req, res) => {
@@ -46,10 +47,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.url === '/tweets') {
     try {
-      const userId = await getUserId('BullTheoryio');
-      console.log('User ID:', userId);
-      const tweets = await getTweets(userId);
-      console.log('Tweets fetched:', tweets.length);
+      const tweets = await getTweets();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, tweets }));
     } catch(e) {
@@ -60,15 +58,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Keep /prices endpoint for future use
-  if (req.url === '/prices') {
-    res.writeHead(200);
-    res.end(JSON.stringify({ success: true, data: {} }));
-    return;
-  }
-
   res.writeHead(404);
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-server.listen(PORT, () => console.log(`Bull Theory proxy running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
